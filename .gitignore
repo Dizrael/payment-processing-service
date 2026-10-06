@@ -1,0 +1,16 @@
+.idea/
+.vscode/
+docs/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.env
+.DS_Store
+*.pdf
+.claude/worktrees/

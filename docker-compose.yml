@@ -1,0 +1,183 @@
+name: payment-processing
+
+x-app: &app
+  build:
+    context: .
+  image: payment-processing-service:local
+  restart: unless-stopped
+  environment:
+    API_KEY: ${API_KEY:-dev-secret-api-key}
+    DATABASE_URL: postgresql+asyncpg://payments:payments@postgres:5432/payments
+    RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    PROCESSING_MAX_ATTEMPTS: ${PROCESSING_MAX_ATTEMPTS:-3}
+    PROCESSING_RETRY_BASE_DELAY_SECONDS: ${PROCESSING_RETRY_BASE_DELAY_SECONDS:-2}
+    CONSUMER_PREFETCH_COUNT: ${CONSUMER_PREFETCH_COUNT:-10}
+    QUEUE_DELIVERY_LIMIT: ${QUEUE_DELIVERY_LIMIT:-3}
+    QUEUE_MAX_LENGTH: ${QUEUE_MAX_LENGTH:-100000}
+    OUTBOX_POLL_INTERVAL_SECONDS: ${OUTBOX_POLL_INTERVAL_SECONDS:-1}
+    OUTBOX_BATCH_SIZE: ${OUTBOX_BATCH_SIZE:-100}
+    WEBHOOK_TIMEOUT_SECONDS: ${WEBHOOK_TIMEOUT_SECONDS:-5}
+    WEBHOOK_TRUSTED_HOSTS: '["webhook-mock"]'
+    GATEWAY_MIN_DELAY_SECONDS: ${GATEWAY_MIN_DELAY_SECONDS:-2}
+    GATEWAY_MAX_DELAY_SECONDS: ${GATEWAY_MAX_DELAY_SECONDS:-5}
+    GATEWAY_SUCCESS_RATE: ${GATEWAY_SUCCESS_RATE:-0.9}
+  depends_on: &app-depends-on
+    postgres:
+      condition: service_healthy
+    rabbitmq:
+      condition: service_healthy
+    migrations:
+      condition: service_completed_successfully
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: payments
+      POSTGRES_DB: payments
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payments -d payments"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  rabbitmq:
+    image: rabbitmq:4.3.6-management-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  pgadmin:
+    image: dpage/pgadmin4:9.18.0
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c", "printf 'postgres:5432:*:payments:payments\\n' > /tmp/pgpass && chmod 600 /tmp/pgpass && exec /entrypoint.sh"]
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+    ports:
+      - "127.0.0.1:5050:80"
+    configs:
+      - source: pgadmin-servers
+        target: /pgadmin4/servers.json
+      - source: pgadmin-preferences
+        target: /pgadmin4/preferences.json
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  migrations:
+    <<: *app
+    restart: "no"
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    command: ["uvicorn", "src.main:api", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  outbox-relay:
+    <<: *app
+    command: ["python", "-m", "src.main"]
+
+  consumer:
+    <<: *app
+    command: ["faststream", "run", "src.main:consumer_app"]
+    depends_on:
+      <<: *app-depends-on
+      webhook-mock:
+        condition: service_healthy
+
+  webhook-mock:
+    <<: *app
+    command: ["uvicorn", "webhook_mock.main:app", "--host", "0.0.0.0", "--port", "8080"]
+    environment:
+      WEBHOOK_MOCK_FAILURE_RATE: ${WEBHOOK_MOCK_FAILURE_RATE:-0.3}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on: {}
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  order-generator:
+    <<: *app
+    profiles: ["load"]
+    restart: "no"
+    command: ["python", "-m", "order_generator.main"]
+    environment:
+      API_KEY: ${API_KEY:-dev-secret-api-key}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ORDER_GENERATOR_API_URL: http://api:8000
+      ORDER_GENERATOR_WEBHOOK_URL: http://webhook-mock:8080/webhooks
+      ORDER_GENERATOR_RATE_PER_SECOND: ${ORDER_GENERATOR_RATE_PER_SECOND:-2}
+      ORDER_GENERATOR_TOTAL: ${ORDER_GENERATOR_TOTAL:-0}
+      ORDER_GENERATOR_DUPLICATE_RATE: ${ORDER_GENERATOR_DUPLICATE_RATE:-0.1}
+    depends_on:
+      api:
+        condition: service_healthy
+      consumer:
+        condition: service_started
+      outbox-relay:
+        condition: service_started
+
+volumes:
+  postgres-data:
+  rabbitmq-data:
+
+configs:
+  pgadmin-servers:
+    content: |
+      {
+        "Servers": {
+          "1": {
+            "Name": "payments",
+            "Group": "Servers",
+            "Host": "postgres",
+            "Port": 5432,
+            "MaintenanceDB": "payments",
+            "Username": "payments",
+            "PassFile": "/tmp/pgpass",
+            "SSLMode": "prefer"
+          }
+        }
+      }
+  pgadmin-preferences:
+    content: |
+      {
+        "preferences": {
+          "misc:user_interface:save_app_state": "false"
+        }
+      }
